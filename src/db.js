@@ -22,13 +22,16 @@ function initSchema(db) {
     );
 
     CREATE TABLE IF NOT EXISTS cues (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      name        TEXT NOT NULL,
-      type        TEXT NOT NULL CHECK (type IN ('light','sound')),
-      track_id    INTEGER NOT NULL REFERENCES tracks(id),
-      start_ms    INTEGER NOT NULL CHECK (start_ms >= 0),
-      duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
-      locked      INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0,1))
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      name         TEXT NOT NULL,
+      type         TEXT NOT NULL CHECK (type IN ('light','sound')),
+      track_id     INTEGER NOT NULL REFERENCES tracks(id),
+      start_ms     INTEGER NOT NULL CHECK (start_ms >= 0),
+      duration_ms  INTEGER NOT NULL CHECK (duration_ms >= 0),
+      locked       INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0,1)),
+      started_at   INTEGER,
+      completed_at INTEGER,
+      CHECK (completed_at IS NULL OR (started_at IS NOT NULL AND completed_at >= started_at))
     );
 
     CREATE TABLE IF NOT EXISTS dependencies (
@@ -97,9 +100,21 @@ function seed(db) {
   tx();
 }
 
+// 旧版数据库（v1 无执行时间列）平滑迁移：缺少列时补齐
+function migrate(db) {
+  const cols = db.prepare('PRAGMA table_info(cues)').all().map((c) => c.name);
+  if (!cols.includes('started_at')) {
+    db.exec('ALTER TABLE cues ADD COLUMN started_at INTEGER');
+  }
+  if (!cols.includes('completed_at')) {
+    db.exec('ALTER TABLE cues ADD COLUMN completed_at INTEGER');
+  }
+}
+
 function initDb() {
   const db = openDb();
   initSchema(db);
+  migrate(db);
   seed(db);
   return db;
 }

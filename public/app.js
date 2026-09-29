@@ -22,6 +22,11 @@ const el = {
   predList: document.getElementById('predList'),
   closeInspector: document.getElementById('closeInspector'),
   deleteBtn: document.getElementById('deleteBtn'),
+  startBtn: document.getElementById('startBtn'),
+  completeBtn: document.getElementById('completeBtn'),
+  runBadge: document.getElementById('runBadge'),
+  runStarted: document.getElementById('runStarted'),
+  runCompleted: document.getElementById('runCompleted'),
 };
 
 let state = { tracks: [], cues: [], deps: [], canUndo: false };
@@ -47,6 +52,23 @@ const cueById = (id) => state.cues.find((c) => c.id === id);
 const fmt = (ms) => (ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 2) + 's';
 const px = (ms) => (ms / 1000) * PX_PER_SEC;
 
+// 服务端记录的实际打点时间（epoch ms）→ 本地可读时间
+const fmtClock = (ms) => (ms == null
+  ? '—'
+  : new Date(ms).toLocaleString('zh-CN', { hour12: false }));
+
+const STATUS_TEXT = { pending: '⏸ 待执行', running: '🟢 执行中', completed: '✅ 已完成' };
+
+function predecessorsOf(id) {
+  return state.deps.filter((d) => d.toCue === id).map((d) => d.fromCue);
+}
+
+// 是否允许打点“开始”：所有前置提示均已完成
+function canStartCue(c) {
+  if (!c || c.status !== 'pending') return false;
+  return predecessorsOf(c.id).every((pid) => cueById(pid)?.status === 'completed');
+}
+
 function toast(message, kind = 'info', blockers) {
   el.toast.innerHTML = '';
   const main = document.createElement('div');
@@ -61,6 +83,8 @@ function toast(message, kind = 'info', blockers) {
       const line = document.createElement('span');
       line.className = 'bl-chain';
       const tag = b.type === 'locked' ? '🔒 锁定阻塞链'
+        : b.type === 'started' ? '🟢 已开始阻塞项'
+        : b.type === 'execution' ? '🚫 执行状态'
         : b.type === 'track-conflict' ? '⏱ 同轨冲突链'
         : b.type === 'dependency' ? '🔗 依赖阻塞链'
         : '⚠ 阻塞链';
@@ -210,7 +234,7 @@ function render() {
       if (hiddenTracks.has(track.id)) continue;
       const s = cueStart(c);
       const cue = document.createElement('div');
-      cue.className = `cue ${c.type}`;
+      cue.className = `cue ${c.type} st-${c.status}`;
       if (c.locked) cue.classList.add('locked');
       if (selectedId === c.id) cue.classList.add('selected');
       if (drag && drag.closure.has(c.id)) cue.classList.add('dragging');
@@ -220,9 +244,30 @@ function render() {
       cue.style.left = px(s) + 'px';
       cue.style.width = Math.max(8, px(c.durationMs)) + 'px';
       cue.dataset.id = c.id;
-      cue.innerHTML = `<span class="cue-name">${c.name}</span>
+      const statIco = c.status === 'completed' ? '✅'
+        : c.status === 'running' ? '🟢'
+        : canStartCue(c) ? '⏸' : '🔒';
+      const statTitle = c.status === 'completed' ? '已完成'
+        : c.status === 'running' ? '执行中'
+        : canStartCue(c) ? '待执行（前置已完成，可开始）'
+        : '待执行（尚有前置未完成）';
+      cue.innerHTML = `<span class="cue-stat" title="${statTitle}">${statIco}</span>
+        <span class="cue-name">${c.name}</span>
         <span class="cue-time">${fmt(s)} · ${fmt(c.durationMs)}</span>
         ${c.locked ? '<span class="lock-ico">🔒</span>' : ''}`;
+
+      // 快捷打点按钮：指针事件不冒泡，避免触发拖动/选中
+      const quick = document.createElement('span');
+      quick.className = 'cue-actions';
+      if (c.status === 'pending' && canStartCue(c)) {
+        quick.appendChild(quickBtn('▶', '开始', c.id, 'start'));
+      } else if (c.status === 'running') {
+        quick.appendChild(quickBtn('✅', '完成', c.id, 'complete'));
+      } else if (c.status === 'completed') {
+        quick.title = `开始 ${fmtClock(c.startedAt)} / 完成 ${fmtClock(c.completedAt)}`;
+      }
+      cue.appendChild(quick);
+
       attachDrag(cue, c);
       lane.appendChild(cue);
     }
@@ -236,6 +281,12 @@ function render() {
 // 不依赖被拖节点本身的指针捕获。
 
 function startDrag(e, cue) {
+  if (cue.startedAt != null) {
+    toast(cue.completedAt != null
+      ? '✅ 该提示已完成，执行记录不可移动'
+      : '🟢 该提示已开始，执行中不可移动（级联移动会被整次拒绝）', 'error');
+    return;
+  }
   if (cue.locked) { toast('🔒 该提示已锁定，无法拖动', 'error'); return; }
   e.preventDefault();
   drag = {
@@ -246,6 +297,41 @@ function startDrag(e, cue) {
     deltaMs: 0,
     moved: false,
   };
+}
+
+function quickBtn(text, title, id, action) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = `cue-act ${action}`;
+  b.textContent = text;
+  b.title = title;
+  // 阻止指针与点击冒泡到 cue（否则会触发拖动 / 选中）
+  b.addEventListener('pointerdown', (e) => e.stopPropagation());
+  b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    markCue(id, action);
+  });
+  return b;
+}
+
+// ---------- 执行打点 ----------
+
+async function markCue(id, action) {
+  const label = action === 'start' ? '开始' : '完成';
+  try {
+    const next = await api(`/api/cues/${id}/${action}`, { method: 'POST', body: '{}' });
+    applyState(next);
+    if (selectedId === id) selectCue(id);
+    toast(`✅ 已记录「${cueById(id)?.name}」${label}时间（服务端时钟）`, 'success');
+  } catch (err) {
+    if (err.status === 409) {
+      markBlocked(err.body.blockers);
+      render();
+      toast(`⛔ ${label}被拒绝，记录未改变：${err.message}`, 'error', err.body.blockers);
+    } else if (err.status !== 404) {
+      toast(err.message, 'error');
+    }
+  }
 }
 
 window.addEventListener('pointermove', (e) => {
@@ -324,6 +410,10 @@ function markBlocked(blockers) {
 
 // ---------- 选中 / 详情面板 ----------
 
+function setEditFormDisabled(f, disabled) {
+  for (const node of f.querySelectorAll('input, select, button')) node.disabled = disabled;
+}
+
 function selectCue(id) {
   selectedId = id;
   const c = cueById(id);
@@ -344,12 +434,43 @@ function selectCue(id) {
   state.cues.filter((x) => x.id !== id).forEach((x) => {
     const lab = document.createElement('label');
     lab.innerHTML = `<input type="checkbox" value="${x.id}" ${preds.has(x.id) ? 'checked' : ''}/>
-      ${x.type === 'light' ? '💡' : '🔊'} ${x.name} <span style="color:#93a0b8">(${fmt(x.startMs)}起)</span>`;
+      ${x.type === 'light' ? '💡' : '🔊'} ${x.name}
+      <span class="pred-status st-${x.status}">${STATUS_TEXT[x.status]}</span>
+      <span style="color:#93a0b8">(${fmt(x.startMs)}起)</span>`;
     el.predList.appendChild(lab);
   });
   if (!state.cues.some((x) => x.id !== id)) {
     el.predList.innerHTML = '<span style="color:#93a0b8;font-size:12px">暂无其他提示可作为前置</span>';
   }
+
+  // ---- 执行状态区 ----
+  el.runBadge.textContent = STATUS_TEXT[c.status];
+  el.runBadge.className = `run-badge st-${c.status}`;
+  el.runStarted.textContent = fmtClock(c.startedAt);
+  el.runCompleted.textContent = fmtClock(c.completedAt);
+  el.startBtn.disabled = c.status !== 'pending' || !canStartCue(c);
+  el.completeBtn.disabled = c.status !== 'running';
+  if (c.status === 'pending' && !canStartCue(c)) {
+    el.startBtn.title = '所有前置提示完成后才能开始';
+  } else {
+    el.startBtn.title = c.status === 'pending' ? '记录实际开始时间（服务端）' : '已开始的提示不能重开';
+  }
+  el.completeBtn.title = c.status === 'running' ? '记录实际完成时间（服务端）' : '仅执行中的提示可完成';
+
+  // ---- 一旦开始：编辑/删除冻结 ----
+  const frozen = c.startedAt != null;
+  setEditFormDisabled(f, frozen);
+  const note = document.getElementById('frozenNote');
+  if (frozen) {
+    note.textContent = c.completedAt != null
+      ? '✅ 该提示已完成，执行记录不可编辑、删除、移动或撤销'
+      : '🟢 该提示已开始，执行中不可编辑、删除、移动或撤销';
+    note.classList.remove('hidden');
+  } else {
+    note.classList.add('hidden');
+    note.textContent = '';
+  }
+
   render();
 }
 
@@ -361,9 +482,21 @@ function closeInspectorPanel() {
 }
 el.closeInspector.onclick = closeInspectorPanel;
 
+el.startBtn.addEventListener('click', () => {
+  if (selectedId != null) markCue(selectedId, 'start');
+});
+el.completeBtn.addEventListener('click', () => {
+  if (selectedId != null) markCue(selectedId, 'complete');
+});
+
 el.editForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (selectedId == null) return;
+  const cur = cueById(selectedId);
+  if (cur && cur.startedAt != null) {
+    toast(cur.completedAt != null ? '✅ 已完成的提示不可编辑' : '🟢 已开始的提示不可编辑', 'error');
+    return;
+  }
   const f = el.editForm;
   const predecessorIds = [...el.predList.querySelectorAll('input:checked')].map((i) => Number(i.value));
   try {
@@ -394,6 +527,10 @@ el.editForm.addEventListener('submit', async (e) => {
 el.deleteBtn.addEventListener('click', async () => {
   if (selectedId == null) return;
   const c = cueById(selectedId);
+  if (c.startedAt != null) {
+    toast(c.completedAt != null ? '✅ 已完成的提示不可删除' : '🟢 已开始的提示不可删除', 'error');
+    return;
+  }
   if (!confirm(`确认删除提示「${c.name}」？相关依赖会一并移除。`)) return;
   try {
     const next = await api(`/api/cues/${selectedId}`, { method: 'DELETE' });

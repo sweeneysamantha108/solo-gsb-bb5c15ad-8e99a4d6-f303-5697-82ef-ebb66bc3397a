@@ -20,7 +20,13 @@ function routes(db) {
   function getCues() {
     return db.prepare(`
       SELECT id, name, type, track_id AS trackId,
-             start_ms AS startMs, duration_ms AS durationMs, locked
+             start_ms AS startMs, duration_ms AS durationMs, locked,
+             started_at AS startedAt, completed_at AS completedAt,
+             CASE
+               WHEN completed_at IS NOT NULL THEN 'completed'
+               WHEN started_at   IS NOT NULL THEN 'running'
+               ELSE 'pending'
+             END AS status
       FROM cues
       ORDER BY start_ms, id
     `).all();
@@ -35,6 +41,25 @@ function routes(db) {
 
   function canUndo() {
     return db.prepare('SELECT COUNT(*) AS n FROM undo_log').get().n > 0;
+  }
+
+  function getCue(id) {
+    return db.prepare(`
+      SELECT id, name, type, track_id AS trackId,
+             start_ms AS startMs, duration_ms AS durationMs, locked,
+             started_at AS startedAt, completed_at AS completedAt,
+             CASE
+               WHEN completed_at IS NOT NULL THEN 'completed'
+               WHEN started_at   IS NOT NULL THEN 'running'
+               ELSE 'pending'
+             END AS status
+      FROM cues WHERE id = ?
+    `).get(id);
+  }
+
+  // 服务端实际打点时间的人类可读格式（用于冲突原因说明）
+  function fmtClock(ms) {
+    return new Date(ms).toLocaleString('zh-CN', { hour12: false });
   }
 
   function state() {
@@ -143,12 +168,24 @@ function routes(db) {
   // 编辑提示（含依赖全量替换）
   router.patch('/cues/:id', (req, res) => {
     const id = Number(req.params.id);
-    const cue = db.prepare(`
-      SELECT id, name, type, track_id AS trackId,
-             start_ms AS startMs, duration_ms AS durationMs, locked
-      FROM cues WHERE id = ?
-    `).get(id);
+    const cue = getCue(id);
     if (!cue) return res.status(404).json({ error: '提示不存在' });
+
+    // 一旦开始执行即冻结：不可编辑
+    if (cue.startedAt != null) {
+      return res.status(409).json({
+        error: cue.completedAt != null
+          ? `提示「${cue.name}」已完成，执行记录不可修改`
+          : `提示「${cue.name}」已开始（${fmtClock(cue.startedAt)}），不可再编辑`,
+        blockers: [{
+          type: 'started',
+          chain: [id],
+          detail: cue.completedAt != null
+            ? '已开始/已完成的提示禁止编辑'
+            : '进行中的提示禁止编辑',
+        }],
+      });
+    }
 
     const b = req.body || {};
     const next = {
@@ -261,9 +298,112 @@ function routes(db) {
   // 删除提示（依赖随之外键级联删除）
   router.delete('/cues/:id', (req, res) => {
     const id = Number(req.params.id);
-    const cue = db.prepare('SELECT id FROM cues WHERE id = ?').get(id);
+    const cue = getCue(id);
     if (!cue) return res.status(404).json({ error: '提示不存在' });
+    if (cue.startedAt != null) {
+      return res.status(409).json({
+        error: cue.completedAt != null
+          ? `提示「${cue.name}」已完成，执行记录不可删除`
+          : `提示「${cue.name}」已开始（${fmtClock(cue.startedAt)}），不可删除`,
+        blockers: [{
+          type: 'started',
+          chain: [id],
+          detail: cue.completedAt != null
+            ? '已开始/已完成的提示禁止删除'
+            : '进行中的提示禁止删除',
+        }],
+      });
+    }
     db.prepare('DELETE FROM cues WHERE id = ?').run(id);
+    res.json(state());
+  });
+
+  // ---------- 执行打点：开始 ----------
+
+  router.post('/cues/:id/start', (req, res) => {
+    const id = Number(req.params.id);
+    const cue = getCue(id);
+    if (!cue) return res.status(404).json({ error: '提示不存在' });
+
+    // 重复开始 / 重开：说明原因且不改变记录
+    if (cue.completedAt != null) {
+      return res.status(409).json({
+        error: `提示「${cue.name}」已完成（开始于 ${fmtClock(cue.startedAt)}，完成于 ${fmtClock(cue.completedAt)}），不能重开`,
+        blockers: [{
+          type: 'execution',
+          chain: [id],
+          detail: '已完成的提示不能重新开始；现有执行记录保持不变',
+        }],
+      });
+    }
+    if (cue.startedAt != null) {
+      return res.status(409).json({
+        error: `提示「${cue.name}」已开始（${fmtClock(cue.startedAt)}），重复开始不会重复记录`,
+        blockers: [{
+          type: 'execution',
+          chain: [id],
+          detail: '提示处于执行中，开始时间保持首次打点记录',
+        }],
+      });
+    }
+
+    // 所有前置提示均已完成才能开始
+    const preds = db.prepare(`
+      SELECT c.id, c.name, c.started_at AS startedAt, c.completed_at AS completedAt
+      FROM dependencies d JOIN cues c ON c.id = d.from_cue
+      WHERE d.to_cue = ?
+    `).all(id);
+    const blockers = [];
+    for (const p of preds) {
+      if (p.completedAt == null) {
+        blockers.push({
+          type: 'dependency',
+          chain: [p.id, id],
+          detail: p.startedAt == null
+            ? `前置提示「${p.name}」尚未开始，本提示不能开始`
+            : `前置提示「${p.name}」执行中、尚未完成，本提示不能开始`,
+        });
+      }
+    }
+    if (blockers.length) {
+      return conflict(res, `提示「${cue.name}」尚有未完成的前置提示，不能开始`, blockers);
+    }
+
+    db.prepare('UPDATE cues SET started_at = ? WHERE id = ? AND started_at IS NULL')
+      .run(Date.now(), id);
+    res.json(state());
+  });
+
+  // ---------- 执行打点：完成 ----------
+
+  router.post('/cues/:id/complete', (req, res) => {
+    const id = Number(req.params.id);
+    const cue = getCue(id);
+    if (!cue) return res.status(404).json({ error: '提示不存在' });
+
+    if (cue.completedAt != null) {
+      return res.status(409).json({
+        error: `提示「${cue.name}」已完成（完成于 ${fmtClock(cue.completedAt)}），重复完成不会重复记录`,
+        blockers: [{
+          type: 'execution',
+          chain: [id],
+          detail: '完成时间保持首次打点记录，不做修改',
+        }],
+      });
+    }
+    if (cue.startedAt == null) {
+      return res.status(409).json({
+        error: `提示「${cue.name}」尚未开始，不能完成（完成必须发生在开始之后）`,
+        blockers: [{
+          type: 'execution',
+          chain: [id],
+          detail: '请先打点“开始”',
+        }],
+      });
+    }
+
+    db.prepare('UPDATE cues SET completed_at = ? WHERE id = ? AND started_at IS NOT NULL AND completed_at IS NULL')
+      .run(Date.now(), id);
     res.json(state());
   });
 
@@ -304,6 +444,24 @@ function routes(db) {
 
     // 1) 求后继传递闭包 —— 所有需要级联移动的提示
     const affected = transitiveClosure(out, [rootId]);
+
+    // 1.5) 执行冻结检查：涉及任一已开始的提示，整次拒绝（优先于锁定检查）
+    const startedBlockers = [];
+    for (const aid of affected) {
+      const ac = byId.get(aid);
+      if (ac.startedAt != null) {
+        startedBlockers.push({
+          type: 'started',
+          chain: chain(rootId, aid, null, out),
+          detail: ac.completedAt != null
+            ? `提示「${ac.name}」已完成，执行记录不可移动，整条链被阻塞`
+            : `提示「${ac.name}」已开始（${fmtClock(ac.startedAt)}），整条链不能移动`,
+        });
+      }
+    }
+    if (startedBlockers.length) {
+      return conflict(res, '移动回滚：级联范围内存在已开始的提示', startedBlockers);
+    }
 
     // 2) 锁定检查（拖动路径上的锁定项整次回滚）
     const blockers = [];
@@ -418,6 +576,15 @@ function routes(db) {
       if (!cue) {
         blockers.push({ type: 'missing', chain: [mv.id], detail: '原提示已被删除，无法撤销' });
         continue;
+      }
+      if (cue.startedAt != null) {
+        blockers.push({
+          type: 'started',
+          chain: [mv.id],
+          detail: cue.completedAt != null
+            ? `提示「${cue.name}」已完成，执行记录不可撤销移动`
+            : `提示「${cue.name}」已开始（${fmtClock(cue.startedAt)}），不可撤销移动`,
+        });
       }
       if (cue.locked) {
         blockers.push({ type: 'locked', chain: [mv.id], detail: `提示「${cue.name}」现已锁定` });
