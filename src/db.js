@@ -28,7 +28,11 @@ function initSchema(db) {
       track_id    INTEGER NOT NULL REFERENCES tracks(id),
       start_ms    INTEGER NOT NULL CHECK (start_ms >= 0),
       duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
-      locked      INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0,1))
+      locked      INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0,1)),
+      status      TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','running','done')),
+      started_at    INTEGER,
+      completed_at  INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS dependencies (
@@ -50,6 +54,20 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_deps_from       ON dependencies(from_cue);
     CREATE INDEX IF NOT EXISTS idx_deps_to         ON dependencies(to_cue);
   `);
+}
+
+// 旧版本数据库平滑升级：补齐现场打点所需列
+function migrate(db) {
+  const cols = db.prepare('PRAGMA table_info(cues)').all().map((c) => c.name);
+  if (!cols.includes('status')) {
+    db.exec(`ALTER TABLE cues ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`);
+  }
+  if (!cols.includes('started_at')) {
+    db.exec('ALTER TABLE cues ADD COLUMN started_at INTEGER');
+  }
+  if (!cols.includes('completed_at')) {
+    db.exec('ALTER TABLE cues ADD COLUMN completed_at INTEGER');
+  }
 }
 
 function seed(db) {
@@ -100,6 +118,7 @@ function seed(db) {
 function initDb() {
   const db = openDb();
   initSchema(db);
+  migrate(db);
   seed(db);
   return db;
 }

@@ -187,6 +187,48 @@ form .check input { margin: 0; }
 .cue .cue-time { opacity: 0.75; font-variant-numeric: tabular-nums; }
 .cue .lock-ico { margin-left: auto; }
 
+/* 现场执行状态：执行中脉动描边、已完成降饱和 */
+.cue.st-running { animation: pulseRun 1.6s ease-in-out infinite; }
+@keyframes pulseRun {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(70, 201, 139, 0.55); }
+  50% { box-shadow: 0 0 0 3px rgba(70, 201, 139, 0.95); }
+}
+.cue.st-done { opacity: 0.62; }
+.cue.st-done .cue-name { text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.45); }
+
+/* 状态徽章 */
+.st-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 9px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.st-badge.st-pending { background: rgba(147, 160, 184, 0.22); color: var(--muted); border: 1px solid #3a4763; }
+.st-badge.st-running { background: rgba(70, 201, 139, 0.22); color: #7ee2b2; border: 1px solid var(--ok); }
+.st-badge.st-done { background: rgba(79, 140, 255, 0.22); color: #9fbdff; border: 1px solid var(--accent); }
+
+/* 提示块上的打点小按钮 */
+.cue-act {
+  margin-left: auto;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.35);
+  background: rgba(15, 20, 32, 0.72);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.cue-act + .lock-ico { margin-left: 0; }
+.act-start:hover { border-color: var(--ok); background: rgba(70, 201, 139, 0.35); }
+.act-complete:hover { border-color: var(--accent); background: rgba(79, 140, 255, 0.35); }
+
 .cue.live-block { animation: pulseBlock 0.5s ease-in-out 0s 5; }
 @keyframes pulseBlock {
   0%, 100% { box-shadow: 0 0 0 0 rgba(255, 77, 94, 0); }
@@ -215,6 +257,36 @@ form .check input { margin: 0; }
   font-size: 20px; cursor: pointer;
 }
 .inspector-actions { display: flex; gap: 10px; margin-top: 12px; }
+.btn.ok { background: var(--ok); border-color: var(--ok); color: #08221a; font-weight: 600; }
+
+/* 现场执行面板 */
+.exec-panel {
+  background: var(--panel-2);
+  border: 1px solid #3a4763;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.exec-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 0;
+}
+.exec-row strong { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+.exec-actions { display: flex; gap: 8px; margin-top: 10px; }
+.exec-actions .btn { flex: 1; }
+.exec-note { margin-top: 8px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+/* 已开始提示的编排字段只读外观 */
+#editForm input:disabled, #editForm select:disabled, #editForm button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+#editForm button:disabled { opacity: 0.4; }
 fieldset { border: 1px solid #3a4763; border-radius: 8px; margin: 6px 0 0; padding: 8px; }
 legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
 .pred-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }

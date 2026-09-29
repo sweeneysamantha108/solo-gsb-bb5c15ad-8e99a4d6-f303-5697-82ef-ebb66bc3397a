@@ -51,6 +51,8 @@
           <span class="dot sound"></span>音效
           <span class="dep-sample">→</span> 完成后触发
           <span class="lock-sample">🔒</span> 锁定项
+          <span class="st-badge st-running">执行中</span>
+          <span class="st-badge st-done">已完成</span>
         </div>
       </div>
       <div id="timelineScroll" class="timeline-scroll">
@@ -65,6 +67,19 @@
     <aside id="inspector" class="inspector hidden">
       <button id="closeInspector" class="close">×</button>
       <h2>提示详情</h2>
+      <div id="execPanel" class="exec-panel">
+        <div class="exec-row">
+          <span>状态</span>
+          <span id="execStatus" class="st-badge"></span>
+        </div>
+        <div class="exec-row"><span>实际开始</span><strong id="execStarted">—</strong></div>
+        <div class="exec-row"><span>实际完成</span><strong id="execCompleted">—</strong></div>
+        <div class="exec-actions">
+          <button type="button" id="startBtn" class="btn primary">▶ 标记开始</button>
+          <button type="button" id="completeBtn" class="btn ok">✔ 标记完成</button>
+        </div>
+        <div id="execNote" class="exec-note"></div>
+      </div>
       <form id="editForm">
         <label>名称<input name="name" required /></label>
         <label>类型

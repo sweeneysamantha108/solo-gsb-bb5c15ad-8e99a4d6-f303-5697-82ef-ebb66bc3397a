@@ -22,7 +22,18 @@ const el = {
   predList: document.getElementById('predList'),
   closeInspector: document.getElementById('closeInspector'),
   deleteBtn: document.getElementById('deleteBtn'),
+  execStatus: document.getElementById('execStatus'),
+  execStarted: document.getElementById('execStarted'),
+  execCompleted: document.getElementById('execCompleted'),
+  execNote: document.getElementById('execNote'),
+  startBtn: document.getElementById('startBtn'),
+  completeBtn: document.getElementById('completeBtn'),
 };
+
+const STATUS_TEXT = { pending: '待执行', running: '执行中', done: '已完成' };
+const statusText = (c) => STATUS_TEXT[c.status || 'pending'];
+// 服务端时间戳（epoch 毫秒）→ 本地可读时间
+const fmtClock = (t) => (t == null ? '—' : new Date(t).toLocaleString('zh-CN', { hour12: false }));
 
 let state = { tracks: [], cues: [], deps: [], canUndo: false };
 let hiddenTracks = new Set();
@@ -61,8 +72,9 @@ function toast(message, kind = 'info', blockers) {
       const line = document.createElement('span');
       line.className = 'bl-chain';
       const tag = b.type === 'locked' ? '🔒 锁定阻塞链'
+        : b.type === 'started' ? '▶ 已开始阻塞'
         : b.type === 'track-conflict' ? '⏱ 同轨冲突链'
-        : b.type === 'dependency' ? '🔗 依赖阻塞链'
+        : b.type === 'dependency' || b.type === 'execution' ? '🔗 依赖阻塞链'
         : '⚠ 阻塞链';
       line.textContent = `${tag}：${chain.join(' → ')}${b.detail ? `（${b.detail}）` : ''}`;
       el.toast.appendChild(line);
@@ -210,7 +222,7 @@ function render() {
       if (hiddenTracks.has(track.id)) continue;
       const s = cueStart(c);
       const cue = document.createElement('div');
-      cue.className = `cue ${c.type}`;
+      cue.className = `cue ${c.type} st-${c.status || 'pending'}`;
       if (c.locked) cue.classList.add('locked');
       if (selectedId === c.id) cue.classList.add('selected');
       if (drag && drag.closure.has(c.id)) cue.classList.add('dragging');
@@ -220,9 +232,21 @@ function render() {
       cue.style.left = px(s) + 'px';
       cue.style.width = Math.max(8, px(c.durationMs)) + 'px';
       cue.dataset.id = c.id;
+      const st = c.status || 'pending';
+      const cueAction = st === 'pending'
+        ? '<button type="button" class="cue-act act-start" title="标记开始">▶</button>'
+        : st === 'running'
+          ? '<button type="button" class="cue-act act-complete" title="标记完成">✔</button>'
+          : '';
       cue.innerHTML = `<span class="cue-name">${c.name}</span>
+        <span class="st-badge st-${st}">${statusText(c)}</span>
         <span class="cue-time">${fmt(s)} · ${fmt(c.durationMs)}</span>
+        ${cueAction}
         ${c.locked ? '<span class="lock-ico">🔒</span>' : ''}`;
+      // 打点按钮不触发拖动/选中
+      cue.querySelectorAll('.cue-act').forEach((btn) => {
+        btn.addEventListener('pointerdown', (e) => e.stopPropagation());
+      });
       attachDrag(cue, c);
       lane.appendChild(cue);
     }
@@ -237,6 +261,10 @@ function render() {
 
 function startDrag(e, cue) {
   if (cue.locked) { toast('🔒 该提示已锁定，无法拖动', 'error'); return; }
+  if ((cue.status || 'pending') !== 'pending') {
+    toast(`▶ 该提示${statusText(cue)}，已开始的提示不可移动`, 'error');
+    return;
+  }
   e.preventDefault();
   drag = {
     rootId: cue.id,
@@ -247,6 +275,18 @@ function startDrag(e, cue) {
     moved: false,
   };
 }
+
+// 时间轴上的打点按钮（事件委托，render 重建 DOM 后依然生效）
+el.lanes.addEventListener('click', (e) => {
+  const btn = e.target.closest('.cue-act');
+  if (!btn) return;
+  e.stopPropagation();
+  const node = btn.closest('.cue');
+  if (!node) return;
+  const id = Number(node.dataset.id);
+  if (btn.classList.contains('act-start')) markExecution(id, 'start');
+  else if (btn.classList.contains('act-complete')) markExecution(id, 'complete');
+});
 
 window.addEventListener('pointermove', (e) => {
   if (!drag) return;
@@ -304,8 +344,9 @@ function attachDrag(node, cue) {
     startDrag(e, cue);
   });
   // 未移动即抬起视为点击选中（window pointerup 负责处理拖动提交）
-  node.addEventListener('click', () => {
+  node.addEventListener('click', (e) => {
     if (Date.now() - lastDragEndAt < 150) return;
+    if (e.target.closest('.cue-act')) return; // 打点按钮由 lanes 上的委托处理
     selectCue(cue.id);
   });
 }
@@ -331,6 +372,20 @@ function selectCue(id) {
   document.body.querySelector('main').classList.add('inspector-open');
   el.inspector.classList.remove('hidden');
   const f = el.editForm;
+  const st = c.status || 'pending';
+  const readOnly = st !== 'pending';
+
+  // 现场执行面板
+  el.execStatus.textContent = statusText(c);
+  el.execStatus.className = `st-badge st-${st}`;
+  el.execStarted.textContent = fmtClock(c.startedAt);
+  el.execCompleted.textContent = fmtClock(c.completedAt);
+  el.startBtn.disabled = st !== 'pending';
+  el.completeBtn.disabled = st !== 'running';
+  el.execNote.textContent = readOnly
+    ? '该提示已开始，编排内容不可编辑或删除；执行记录由服务端保存。'
+    : '待执行：所有前置提示完成后方可标记开始。';
+
   f.name.value = c.name;
   f.type.value = c.type;
   f.trackId.innerHTML = state.tracks.map((t) =>
@@ -350,6 +405,9 @@ function selectCue(id) {
   if (!state.cues.some((x) => x.id !== id)) {
     el.predList.innerHTML = '<span style="color:#93a0b8;font-size:12px">暂无其他提示可作为前置</span>';
   }
+
+  // 已开始：编排字段、保存、删除全部禁用（在前置列表重建之后执行）
+  f.querySelectorAll('input, select, button').forEach((node) => { node.disabled = readOnly; });
   render();
 }
 
@@ -404,6 +462,29 @@ el.deleteBtn.addEventListener('click', async () => {
     toast(err.message, 'error');
   }
 });
+
+// ---------- 现场打点（开始 / 完成） ----------
+
+async function markExecution(id, action) {
+  const verb = action === 'start' ? '开始' : '完成';
+  try {
+    const next = await api(`/api/cues/${id}/${action}`, { method: 'POST', body: '{}' });
+    applyState(next);
+    if (selectedId != null) selectCue(selectedId); // 刷新面板中的状态与实际时间
+    toast(`✅ 已标记「${cueById(id).name}」${verb}`, 'success');
+  } catch (err) {
+    if (err.status === 409) {
+      markBlocked(err.body.blockers);
+      render();
+      if (selectedId != null) selectCue(selectedId);
+      toast(`未记录${verb}：${err.message}`, 'error', err.body.blockers);
+    } else {
+      toast(err.message, 'error');
+    }
+  }
+}
+el.startBtn.addEventListener('click', () => selectedId != null && markExecution(selectedId, 'start'));
+el.completeBtn.addEventListener('click', () => selectedId != null && markExecution(selectedId, 'complete'));
 
 // ---------- 新建表单 ----------
 
